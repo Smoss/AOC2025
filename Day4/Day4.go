@@ -13,30 +13,17 @@ func make_coord(i int, j int) string {
 	return strconv.Itoa(i) + "," + strconv.Itoa(j)
 }
 
-func check_rune(i int, j int, rollsChan chan<- *readOp, total *atomic.Int64) bool {
+func check_rune(i int, j int, rolls map[string]rune, total *atomic.Int64) bool {
 	coord := make_coord(i, j)
-	resultChan := make(chan *readResult)
-	rollsChan <- &readOp{
-		key:        coord,
-		resultChan: resultChan,
-	}
-	result := <-resultChan
-	if val, prs := result.val, result.prs; !prs || val != '@' {
+	if val, prs := rolls[coord]; !prs || val != '@' {
 		return false
 	}
 	nearby_rolls := 0
 	for x := -1; x < 2; x++ {
 		for y := -1; y < 2; y++ {
 			if x != 0 || y != 0 {
-				checkResultChan := make(chan *readResult)
-
 				check_coord := make_coord(i+x, y+j)
-				rollsChan <- &readOp{
-					key:        check_coord,
-					resultChan: checkResultChan,
-				}
-				checkResult := <-checkResultChan
-				check_val, check_prs := checkResult.val, checkResult.prs
+				check_val, check_prs := rolls[check_coord]
 				if check_prs && check_val == '@' {
 					nearby_rolls++
 				}
@@ -50,41 +37,27 @@ func check_rune(i int, j int, rollsChan chan<- *readOp, total *atomic.Int64) boo
 	return false
 }
 
-type readResult struct {
-	val rune
-	prs bool
-}
-
-type readOp struct {
-	key        string
-	resultChan chan *readResult
-}
-
 type writeOp struct {
 	key         string
-	val         rune
 	confirmChan chan *struct{}
 }
 
-func listen(readChan <-chan *readOp, writeChan <-chan *writeOp, rolls *map[string]rune) {
+func listen(resetChan <-chan chan *struct{}, writeChan <-chan *writeOp, rollsToRemove *[]string) {
 	for {
 		select {
-		case read := <-readChan:
-			val, prs := (*rolls)[read.key]
-			read.resultChan <- &readResult{
-				val: val,
-				prs: prs,
-			}
 		case write := <-writeChan:
-			(*rolls)[write.key] = write.val
+			*rollsToRemove = append(*rollsToRemove, write.key)
 			write.confirmChan <- &struct{}{}
+		case responseChan := <-resetChan:
+			*rollsToRemove = make([]string, 0)
+			responseChan <- &struct{}{}
 		}
 	}
 }
 
 func main() {
 	data, _ := os.ReadFile("input.txt")
-	raw_rolls := strings.Split(string(data), "\n")
+	raw_rolls := strings.Split(strings.ReplaceAll(string(data), "\r", ""), "\n")
 
 	rolls := make(map[string]rune)
 	var total_rolls atomic.Int64
@@ -97,40 +70,39 @@ func main() {
 			rolls[make_coord(i, j)] = val
 		}
 	}
-	readChan := make(chan *readOp)
-	writeChan := make(chan *writeOp)
-	go listen(
-		readChan,
-		writeChan,
-		&rolls,
-	)
 
 	var wait_group sync.WaitGroup
 	for i, line := range raw_rolls {
 		for j := range line {
 			wait_group.Go(
 				func() {
-					check_rune(i, j, readChan, &total_rolls)
+					check_rune(i, j, rolls, &total_rolls)
 				})
 
 		}
 	}
 	wait_group.Wait()
+	writeChan := make(chan *writeOp)
+	resetChan := make(chan chan *struct{})
 	less_rolls := true
+	rollsToRemove := make([]string, 0)
+	go listen(
+		resetChan,
+		writeChan,
+		&rollsToRemove,
+	)
 	for less_rolls {
 		less_rolls = false
 		for i, line := range raw_rolls {
 			for j := range line {
 				wait_group.Go(
 					func() {
-						can_remove := check_rune(i, j, readChan, &total_rolls_2)
+						can_remove := check_rune(i, j, rolls, &total_rolls_2)
 						coord := make_coord(i, j)
 						if can_remove {
-							less_rolls = true
 							confirmChan := make(chan *struct{})
 							writeChan <- &writeOp{
 								key:         coord,
-								val:         '.',
 								confirmChan: confirmChan,
 							}
 							<-confirmChan
@@ -139,6 +111,13 @@ func main() {
 			}
 		}
 		wait_group.Wait()
+		for _, coord := range rollsToRemove {
+			rolls[coord] = '.'
+		}
+		less_rolls = len(rollsToRemove) > 0
+		responseChan := make(chan *struct{})
+		resetChan <- responseChan
+		<-responseChan
 	}
 
 	fmt.Printf("Part 1: %d, Part 2: %d", total_rolls.Load(), total_rolls_2.Load())
